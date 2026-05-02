@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback } from "react";
-import { generateImage, generateI2I, uploadFile } from "../muapi.js";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { generateImage, generateI2I, uploadFile } from "../provider.js";
+import { getProvider, getModels as fetchProviderModels, PROVIDER_NEWAPI } from "../provider.js";
 import {
   t2iModels,
   i2iModels,
@@ -773,6 +774,39 @@ export default function ImageStudio({
   const [batchSize, setBatchSize] = useState(1);
   const [localHistory, setLocalHistory] = useState([]); // [{id,url,prompt,model,aspect_ratio,timestamp}]
 
+  // ── Provider-aware model whitelist ──────────────────────────────────────
+  // When the active provider is new-api, we filter the static t2i/i2i lists
+  // to only the model IDs that the configured relay actually advertises via
+  // /v1/models. Any extra models the relay exposes that are NOT in the static
+  // catalog are appended as generic entries so the user can still pick them.
+  const [availableModelIds, setAvailableModelIds] = useState(null); // Set<string> | null = no filter
+  const [modelsFetchError, setModelsFetchError] = useState(null);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (getProvider() !== PROVIDER_NEWAPI || !apiKey) {
+      setAvailableModelIds(null);
+      setModelsFetchError(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const ids = await fetchProviderModels(apiKey);
+        if (cancelled) return;
+        setAvailableModelIds(new Set(ids || []));
+        setModelsFetchError(null);
+      } catch (err) {
+        if (cancelled) return;
+        console.warn('[ImageStudio] /v1/models fetch failed:', err);
+        setModelsFetchError(err.message || 'Failed to fetch model list');
+        // Fall back to no filter so the user still sees something usable.
+        setAvailableModelIds(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiKey]);
+
   // Use prop history if provided, otherwise local
   const history = historyItems ?? localHistory;
 
@@ -907,7 +941,45 @@ export default function ImageStudio({
   }, [droppedFiles, onFilesHandled, processDroppedImages]);
 
   // ── Derived: current model lists & helpers ───────────────────────────────
-  const currentModels = imageMode ? i2iModels : t2iModels;
+  const filteredT2I = useMemo(() => {
+    if (!availableModelIds) return t2iModels;
+    const fromCatalog = t2iModels.filter(m => availableModelIds.has(m.id));
+    const known = new Set(fromCatalog.map(m => m.id));
+    const extras = [...availableModelIds]
+      .filter(id => !known.has(id))
+      .map(id => ({ id, name: id, endpoint: id, inputs: {} }));
+    return [...fromCatalog, ...extras];
+  }, [availableModelIds]);
+  const filteredI2I = useMemo(() => {
+    if (!availableModelIds) return i2iModels;
+    const fromCatalog = i2iModels.filter(m => availableModelIds.has(m.id));
+    const known = new Set(fromCatalog.map(m => m.id));
+    const extras = [...availableModelIds]
+      .filter(id => !known.has(id))
+      .map(id => ({ id, name: id, endpoint: id, imageField: 'image_url', inputs: {} }));
+    return [...fromCatalog, ...extras];
+  }, [availableModelIds]);
+  const currentModels = imageMode ? filteredI2I : filteredT2I;
+
+  // If the active selection is no longer in the visible list (e.g., user just
+  // switched provider or /v1/models returned a smaller set), snap to the first
+  // available model so the picker is never showing a hidden selection.
+  useEffect(() => {
+    if (currentModels.length === 0) return;
+    if (currentModels.find(m => m.id === selectedModelId)) return;
+    const first = currentModels[0];
+    setSelectedModelId(first.id);
+    setSelectedModelName(first.name);
+    const ars = imageMode
+      ? getAspectRatiosForI2IModel(first.id)
+      : getAspectRatiosForModel(first.id);
+    const resolutions = imageMode
+      ? getResolutionsForI2IModel(first.id)
+      : getResolutionsForModel(first.id);
+    setSelectedAr(ars[0] || 'auto');
+    setSelectedQuality(resolutions[0] || null);
+    if (imageMode) setMaxImages(getMaxImagesForI2IModel(first.id));
+  }, [currentModels, selectedModelId, imageMode]);
   const currentAspectRatios = imageMode
     ? getAspectRatiosForI2IModel(selectedModelId)
     : getAspectRatiosForModel(selectedModelId);
@@ -935,7 +1007,7 @@ export default function ImageStudio({
       setUploadedImageUrls(newUrls);
 
       if (!imageMode) {
-        const firstI2I = i2iModels[0];
+        const firstI2I = filteredI2I[0] || i2iModels[0];
         const ars = getAspectRatiosForI2IModel(firstI2I.id);
         const resolutions = getResolutionsForI2IModel(firstI2I.id);
         setImageMode(true);
@@ -946,13 +1018,13 @@ export default function ImageStudio({
         setMaxImages(getMaxImagesForI2IModel(firstI2I.id));
       }
     },
-    [imageMode],
+    [imageMode, filteredI2I],
   );
 
   const handleUploadClear = useCallback(() => {
     setUploadedImageUrls([]);
     setImageMode(false);
-    const firstT2I = t2iModels[0];
+    const firstT2I = filteredT2I[0] || t2iModels[0];
     const ars = getAspectRatiosForModel(firstT2I.id);
     const resolutions = getResolutionsForModel(firstT2I.id);
     setSelectedModelId(firstT2I.id);
@@ -960,7 +1032,7 @@ export default function ImageStudio({
     setSelectedAr(ars[0] || "1:1");
     setSelectedQuality(resolutions[0] || null);
     setMaxImages(1);
-  }, []);
+  }, [filteredT2I]);
 
   // ── Model selection ──────────────────────────────────────────────────────
   const handleModelSelect = (m) => {
@@ -996,7 +1068,7 @@ export default function ImageStudio({
     setPrompt("");
     setUploadedImageUrls([]);
     setImageMode(false);
-    const firstT2I = t2iModels[0];
+    const firstT2I = filteredT2I[0] || t2iModels[0];
     const ars = getAspectRatiosForModel(firstT2I.id);
     const resolutions = getResolutionsForModel(firstT2I.id);
     setSelectedModelId(firstT2I.id);

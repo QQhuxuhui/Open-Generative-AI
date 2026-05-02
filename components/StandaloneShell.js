@@ -2,11 +2,18 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { ImageStudio, VideoStudio, LipSyncStudio, CinemaStudio, MarketingStudio, WorkflowStudio, AgentStudio, AppsStudio, getUserBalance } from 'studio';
+import {
+  ImageStudio, VideoStudio, LipSyncStudio, CinemaStudio, MarketingStudio,
+  WorkflowStudio, AgentStudio, AppsStudio,
+  getUserBalance,
+  getProvider, setProvider, getProviderConfig, setNewapiConfig, getActiveApiKey,
+  PROVIDER_MUAPI, PROVIDER_NEWAPI,
+} from 'studio';
 import axios from 'axios';
 import ApiKeyModal from './ApiKeyModal';
+import ProviderSettings from './ProviderSettings';
 
-const TABS = [
+const ALL_TABS = [
   { id: 'image',   label: 'Image Studio' },
   { id: 'video',   label: 'Video Studio' },
   { id: 'lipsync', label: 'Lip Sync' },
@@ -16,6 +23,8 @@ const TABS = [
   { id: 'agents', label: 'Agents' },
   { id: 'apps', label: 'Explore Apps' },
 ];
+// new-api / OpenAI relays only carry image generation; the other studios are Muapi-specific.
+const NEWAPI_VISIBLE_TAB_IDS = new Set(['image']);
 
 const STORAGE_KEY = 'muapi_key';
 
@@ -47,17 +56,22 @@ export default function StandaloneShell() {
     if (slug.includes('agents')) return 'agents';
     if (slug.includes('apps')) return 'apps';
     const firstSegment = slug[0];
-    if (firstSegment && TABS.find(t => t.id === firstSegment)) return firstSegment;
+    if (firstSegment && ALL_TABS.find(t => t.id === firstSegment)) return firstSegment;
     return 'image';
   };
   
   const [apiKey, setApiKey] = useState(null);
+  const [provider, setProviderState] = useState(PROVIDER_MUAPI);
   const [activeTab, setActiveTab] = useState(getInitialTab());
-  
+
   const [balance, setBalance] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [isHeaderVisible, setIsHeaderVisible] = useState(true);
   const [hasMounted, setHasMounted] = useState(false);
+
+  const visibleTabs = provider === PROVIDER_NEWAPI
+    ? ALL_TABS.filter(t => NEWAPI_VISIBLE_TAB_IDS.has(t.id))
+    : ALL_TABS;
 
   // Drag and Drop State
   const [isDragging, setIsDragging] = useState(false);
@@ -74,11 +88,19 @@ export default function StandaloneShell() {
         setActiveTab('apps');
     } else {
         const firstSegment = slug[0];
-        if (firstSegment && TABS.find(t => t.id === firstSegment)) {
+        if (firstSegment && ALL_TABS.find(t => t.id === firstSegment)) {
           setActiveTab(firstSegment);
         }
     }
   }, [slug, getWorkflowInfo]);
+
+  // If the user is on a Muapi-only tab and switches provider to newapi, snap to image studio.
+  useEffect(() => {
+    if (provider === PROVIDER_NEWAPI && !NEWAPI_VISIBLE_TAB_IDS.has(activeTab)) {
+      setActiveTab('image');
+      router.push('/studio/image');
+    }
+  }, [provider, activeTab, router]);
 
   const handleTabChange = (tabId) => {
     setActiveTab(tabId);
@@ -115,16 +137,22 @@ export default function StandaloneShell() {
 
   useEffect(() => {
     setHasMounted(true);
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      setApiKey(stored);
-      fetchBalance(stored);
-      // Sync cookie immediately on mount to establish identity for background requests
-      document.cookie = `muapi_key=${stored}; path=/; max-age=31536000; SameSite=Lax`;
+    const p = getProvider();
+    setProviderState(p);
+    const key = getActiveApiKey();
+    if (key) {
+      setApiKey(key);
+      fetchBalance(key);
+      // Sync cookie for the legacy /api/api/v1 proxy (only used in Muapi mode).
+      document.cookie = `muapi_key=${key}; path=/; max-age=31536000; SameSite=Lax`;
     }
   }, [fetchBalance]);
 
   const handleKeySave = useCallback((key) => {
+    // ApiKeyModal saves via Muapi by default. If the user wants newapi, they
+    // switch in Settings after the initial entry.
+    setProvider(PROVIDER_MUAPI);
+    setProviderState(PROVIDER_MUAPI);
     localStorage.setItem(STORAGE_KEY, key);
     setApiKey(key);
     fetchBalance(key);
@@ -132,11 +160,35 @@ export default function StandaloneShell() {
   }, [fetchBalance]);
 
   const handleKeyChange = useCallback(() => {
+    // Clear keys for both providers and reset to Muapi default. The
+    // ApiKeyModal will re-prompt for a Muapi key; user can switch in Settings.
     localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem('newapi_key');
+    setProvider(PROVIDER_MUAPI);
+    setProviderState(PROVIDER_MUAPI);
     setApiKey(null);
     setBalance(null);
     document.cookie = "muapi_key=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
   }, []);
+
+  // Called from the Provider settings panel. Persists the new config and
+  // swaps the in-memory apiKey to the active provider's key in one step so
+  // the rest of the UI (and provider.js) sees a consistent state.
+  const handleProviderChange = useCallback(({ provider: nextProvider, newapiBaseUrl, newapiKey }) => {
+    if (nextProvider === PROVIDER_NEWAPI) {
+      setNewapiConfig({ baseUrl: newapiBaseUrl, apiKey: newapiKey });
+      setProvider(PROVIDER_NEWAPI);
+      setProviderState(PROVIDER_NEWAPI);
+      setApiKey(newapiKey || null);
+      setBalance(null); // OpenAI relays have no equivalent endpoint
+    } else {
+      setProvider(PROVIDER_MUAPI);
+      setProviderState(PROVIDER_MUAPI);
+      const key = localStorage.getItem(STORAGE_KEY);
+      setApiKey(key || null);
+      if (key) fetchBalance(key);
+    }
+  }, [fetchBalance]);
 
   // Inject API key into all outgoing Axios requests (prop-based approach)
   // We use an interceptor to be selective and NOT send the key to external domains like S3
@@ -257,7 +309,7 @@ export default function StandaloneShell() {
 
           {/* Center: Navigation */}
           <nav className="absolute left-1/2 -translate-x-1/2 flex items-center gap-6">
-            {TABS.map((tab) => (
+            {visibleTabs.map((tab) => (
               <button
                 key={tab.id}
                 onClick={() => handleTabChange(tab.id)}
@@ -278,10 +330,10 @@ export default function StandaloneShell() {
           {/* Right: Actions */}
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-3 bg-white/5 px-3 py-1.5 rounded-full border border-white/5 transition-colors">
-              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              <div className={`w-2 h-2 rounded-full animate-pulse ${provider === PROVIDER_NEWAPI ? 'bg-blue-500' : 'bg-green-500'}`} />
               <div className="flex flex-col">
                 <span className="text-xs font-bold text-white/90">
-                  ${balance !== null ? `${balance}` : '---'}
+                  {provider === PROVIDER_NEWAPI ? 'new-api' : (balance !== null ? `$${balance}` : '$---')}
                 </span>
               </div>
             </div>
@@ -315,40 +367,13 @@ export default function StandaloneShell() {
 
       {/* Settings Modal */}
       {showSettings && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 animate-fade-in-up">
-          <div className="bg-[#0a0a0a] border border-white/10 rounded-xl p-8 w-full max-w-sm shadow-2xl">
-            <h2 className="text-white font-bold text-lg mb-2">Settings</h2>
-            <p className="text-white/40 text-[13px] mb-8">
-              Manage your AI studio preferences and authentication.
-            </p>
-            
-            <div className="space-y-4 mb-8">
-              <div className="bg-white/5 border border-white/[0.03] rounded-md p-4">
-                <label className="block text-xs font-bold text-white/30 mb-2">
-                   Active API Key
-                </label>
-                <div className="text-[13px] font-mono text-white/80">
-                  {apiKey.slice(0, 8)}••••••••••••••••
-                </div>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <button
-                onClick={handleKeyChange}
-                className="flex-1 h-10 rounded-md bg-red-500/10 text-red-400 hover:bg-red-500/20 text-xs font-semibold transition-all"
-              >
-                Change Key
-              </button>
-              <button
-                onClick={() => setShowSettings(false)}
-                className="flex-1 h-10 rounded-md bg-white/5 text-white/80 hover:bg-white/10 text-xs font-semibold transition-all border border-white/5"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+        <ProviderSettings
+          activeApiKey={apiKey}
+          currentProvider={provider}
+          onClose={() => setShowSettings(false)}
+          onChangeKey={handleKeyChange}
+          onSaveProvider={handleProviderChange}
+        />
       )}
     </div>
   );
