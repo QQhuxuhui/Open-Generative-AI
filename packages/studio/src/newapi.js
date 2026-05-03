@@ -118,7 +118,97 @@ function normalizeImageResponse(json) {
     };
 }
 
+// Models whose image output is delivered through /v1/chat/completions instead
+// of /v1/images/generations. new-api's gemini adapter explicitly rejects any
+// non-`imagen-*` model on the images endpoint, so gemini-*-image / nano-banana
+// MUST go through chat-completions and embed the image as a markdown / inline
+// data URL inside the assistant message content.
+function isChatImageModel(model) {
+    if (!model) return false;
+    const m = model.toLowerCase();
+    if (m.includes('nano-banana')) return true;
+    // gemini-*-image, gemini-*-image-preview, gemini-2.5-flash-image, etc.
+    if (/gemini[-.\d]*.*image/.test(m)) return true;
+    return false;
+}
+
+// Pull the first base64 image data URL out of an OpenAI-shaped chat response.
+// new-api's responseGeminiChat2OpenAI wraps inline image parts as either
+// `![image](data:<mime>;base64,<...>)` markdown or `[media](data:<mime>;base64,<...>)`.
+// We tolerate either, plus a bare data URL embedded anywhere in the text.
+function extractImageFromChat(json) {
+    const choices = json?.choices;
+    if (!Array.isArray(choices) || choices.length === 0) {
+        throw new Error('new-api chat response: no choices returned (upstream may be out of credits or rate-limited)');
+    }
+    const msg = choices[0]?.message;
+    let content = msg?.content;
+    if (Array.isArray(content)) {
+        // Some upstream variants return a parts array. Find an image_url part.
+        for (const part of content) {
+            if (part?.type === 'image_url' && part?.image_url?.url) {
+                return part.image_url.url;
+            }
+            if (typeof part?.text === 'string') {
+                const m = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/.exec(part.text);
+                if (m) return m[0];
+            }
+        }
+    }
+    if (typeof content === 'string') {
+        const m = /data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+/.exec(content);
+        if (m) return m[0];
+        // Plain text reply with no image — likely a safety refusal or text-only fallthrough.
+        const snippet = content.trim().slice(0, 160) || '(empty)';
+        throw new Error(`Model returned no image. Response: ${snippet}`);
+    }
+    throw new Error('Chat response has no extractable image content');
+}
+
+async function generateImageViaChat(apiKey, params, referenceImages) {
+    const baseUrl = getBaseUrl();
+    const userParts = [];
+    if (params.prompt) {
+        userParts.push({ type: 'text', text: params.prompt });
+    }
+    if (Array.isArray(referenceImages) && referenceImages.length > 0) {
+        for (const ref of referenceImages) {
+            // ref is a string: either data:URL (preferred) or remote URL.
+            // The chat API accepts both shapes inside image_url.url.
+            userParts.push({ type: 'image_url', image_url: { url: ref } });
+        }
+    }
+    const body = {
+        model: params.model,
+        messages: [
+            { role: 'user', content: userParts.length > 1 ? userParts : (params.prompt || '') },
+        ],
+        modalities: ['image', 'text'],
+        stream: false,
+    };
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) throw await parseError(response);
+    const json = await response.json();
+    const url = extractImageFromChat(json);
+    return {
+        url,
+        id: json.id || `${json.created || Date.now()}`,
+        revised_prompt: undefined,
+        raw: json,
+    };
+}
+
 export async function generateImage(apiKey, params) {
+    if (isChatImageModel(params.model)) {
+        return generateImageViaChat(apiKey, params, null);
+    }
     const baseUrl = getBaseUrl();
     const body = {
         model: params.model,
@@ -146,7 +236,6 @@ export async function generateImage(apiKey, params) {
 }
 
 export async function generateI2I(apiKey, params) {
-    const baseUrl = getBaseUrl();
     const images = params.images_list?.length > 0
         ? params.images_list
         : (params.image_url ? [params.image_url] : []);
@@ -154,6 +243,13 @@ export async function generateI2I(apiKey, params) {
         throw new Error('No reference image provided for image-to-image');
     }
 
+    if (isChatImageModel(params.model)) {
+        // chat/completions accepts the data URL directly in image_url; no
+        // multipart conversion needed.
+        return generateImageViaChat(apiKey, params, images);
+    }
+
+    const baseUrl = getBaseUrl();
     const form = new FormData();
     form.append('model', params.model);
     if (params.prompt) form.append('prompt', params.prompt);
