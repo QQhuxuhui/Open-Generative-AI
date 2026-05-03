@@ -12,16 +12,21 @@ function getBaseUrl() {
     return raw.replace(/\/+$/, '');
 }
 
-// gpt-image-2 / dall-e-3 / nano-banana sizes accepted by OpenAI Images API
-function aspectToSize(aspect) {
-    switch (aspect) {
+// Map a UI aspect ratio to a `size` string accepted by OpenAI's Images API.
+// - gpt-image-1+ accepts 'auto' as a sentinel meaning "model picks".
+// - dall-e-2 / dall-e-3 do NOT accept 'auto'; they require an explicit size,
+//   so we fall back to 1024x1024 / supported landscape / portrait pairs.
+function aspectToSize(aspect, model) {
+    const isDalle = /^dall-e/i.test(model || '');
+    const a = aspect || 'auto';
+    switch (a) {
         case '1:1':  return '1024x1024';
         case '16:9':
-        case '4:3':  return '1536x1024';
+        case '4:3':  return isDalle ? '1792x1024' : '1536x1024';
         case '9:16':
-        case '3:4':  return '1024x1536';
+        case '3:4':  return isDalle ? '1024x1792' : '1024x1536';
         case 'auto':
-        default:     return 'auto';
+        default:     return isDalle ? '1024x1024' : 'auto';
     }
 }
 
@@ -49,9 +54,19 @@ function dataUrlToBlob(dataUrl) {
 async function urlOrDataToBlob(value) {
     if (typeof value !== 'string') return value; // assume already a Blob/File
     if (value.startsWith('data:')) return dataUrlToBlob(value);
-    // Remote URL — fetch it (CORS depending). Useful when "use as reference" was clicked
-    // on a previously generated image whose URL is under our control.
-    const res = await fetch(value);
+    // Remote URL — fetch then convert to Blob. Cross-origin URLs without CORS
+    // headers will throw a TypeError ("Failed to fetch"); surface a clearer
+    // message so the user knows to re-upload the file instead of clicking
+    // "use as reference" on a remote-hosted image.
+    let res;
+    try {
+        res = await fetch(value);
+    } catch (err) {
+        throw new Error(
+            'Cannot reuse this image as a reference (CORS blocked). ' +
+            'Download the image and re-upload it instead.'
+        );
+    }
     if (!res.ok) throw new Error(`Failed to fetch reference image: ${res.status}`);
     return await res.blob();
 }
@@ -65,9 +80,13 @@ function fileToDataUrl(file) {
     });
 }
 
+// Pass model-family-specific knobs through new-api's `extra_fields` passthrough.
+// We deliberately do NOT include aspect_ratio here — it is already encoded in
+// the standard `size` field via aspectToSize(). Whether the upstream model
+// honors `extra_fields` depends on the channel config (PassThroughBodyEnabled
+// or the upstream's own parsing); see provider.js docs.
 function buildExtraFields(params) {
     const extra = {};
-    // Pass model-family-specific knobs through new-api's extra_fields passthrough.
     if (params.resolution) extra.resolution = params.resolution;
     if (params.quality && !['auto', 'standard', 'hd', 'high', 'medium', 'low'].includes(params.quality)) {
         extra.quality = params.quality;
@@ -75,7 +94,6 @@ function buildExtraFields(params) {
     if (params.seed !== undefined && params.seed !== -1 && params.seed !== null) {
         extra.seed = params.seed;
     }
-    if (params.aspect_ratio) extra.aspect_ratio = params.aspect_ratio;
     return Object.keys(extra).length > 0 ? extra : undefined;
 }
 
@@ -106,7 +124,7 @@ export async function generateImage(apiKey, params) {
         model: params.model,
         prompt: params.prompt,
         n: 1,
-        size: aspectToSize(params.aspect_ratio),
+        size: aspectToSize(params.aspect_ratio, params.model),
     };
     // gpt-image-1+ accepts these directly; dall-e-3 also accepts quality
     if (['standard', 'hd', 'high', 'medium', 'low', 'auto'].includes(params.quality)) {
@@ -140,7 +158,7 @@ export async function generateI2I(apiKey, params) {
     form.append('model', params.model);
     if (params.prompt) form.append('prompt', params.prompt);
     form.append('n', '1');
-    form.append('size', aspectToSize(params.aspect_ratio));
+    form.append('size', aspectToSize(params.aspect_ratio, params.model));
 
     if (['standard', 'hd', 'high', 'medium', 'low', 'auto'].includes(params.quality)) {
         form.append('quality', params.quality);
