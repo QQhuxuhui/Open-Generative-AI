@@ -1,8 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { generateImage, generateI2I, uploadFile } from "../provider.js";
-import { getProvider, getModels as fetchProviderModels, PROVIDER_NEWAPI } from "../provider.js";
+import {
+  generateImage,
+  generateI2I,
+  uploadFile,
+  getAllAvailableModels,
+  getKeyForModel,
+} from "../provider.js";
 import {
   t2iModels,
   i2iModels,
@@ -36,7 +41,11 @@ async function downloadImage(url, filename) {
 
 // ─── UploadButton (inline picker) ───────────────────────────────────────────
 
-function UploadButton({ apiKey, maxImages, onSelect, onClear, initialUrls = [] }) {
+function UploadButton({ maxImages, onSelect, onClear, initialUrls = [] }) {
+  // Note: under the OpenAI-compatible client, uploadFile is purely a
+  // browser-side data URL conversion — no key is required at upload time.
+  // The key is only needed at generate time when the data URL is sent
+  // along with the prompt.
   const [panelOpen, setPanelOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [selectedEntries, setSelectedEntries] = useState([]); // [{url, thumbnail}]
@@ -136,7 +145,7 @@ function UploadButton({ apiKey, maxImages, onSelect, onClear, initialUrls = [] }
           setUploadHistory((prev) => [placeholder, ...prev]);
 
           try {
-            const uploadedUrl = await uploadFile(apiKey, file, (pct) => {
+            const uploadedUrl = await uploadFile('', file, (pct) => {
               setLastUploadProgress(pct);
               setUploadHistory((prev) =>
                 prev.map((h) => (h.id === id ? { ...h, progress: pct } : h)),
@@ -672,6 +681,11 @@ function ModelDropdown({ models, selectedModel, onSelect, onClose }) {
                 <span className="text-xs font-bold text-white tracking-tight">
                   {m.name}
                 </span>
+                {m.sourceKeyName && (
+                  <span className="text-[10px] text-white/40 font-medium">
+                    via {m.sourceKeyName}
+                  </span>
+                )}
               </div>
             </div>
             {selectedModel === m.id && (
@@ -737,12 +751,14 @@ function SimpleDropdown({ title, options, selected, onSelect, onClose }) {
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 export default function ImageStudio({
-  apiKey,
+  keyVersion,
   onGenerationComplete,
   historyItems,
   droppedFiles,
   onFilesHandled,
 }) {
+  // The shell bumps `keyVersion` whenever the multi-key store changes so the
+  // available-models effect below re-runs without any prop drilling of keys.
   const PERSIST_KEY = "hg_image_studio_persistent";
 
   // ── Model / mode state ──────────────────────────────────────────────────
@@ -774,38 +790,22 @@ export default function ImageStudio({
   const [batchSize, setBatchSize] = useState(1);
   const [localHistory, setLocalHistory] = useState([]); // [{id,url,prompt,model,aspect_ratio,timestamp}]
 
-  // ── Provider-aware model whitelist ──────────────────────────────────────
-  // When the active provider is new-api, we filter the static t2i/i2i lists
-  // to only the model IDs that the configured relay actually advertises via
-  // /v1/models. Any extra models the relay exposes that are NOT in the static
-  // catalog are appended as generic entries so the user can still pick them.
-  const [availableModelIds, setAvailableModelIds] = useState(null); // Set<string> | null = no filter
-  const [modelsFetchError, setModelsFetchError] = useState(null);
+  // ── Multi-key model whitelist ───────────────────────────────────────────
+  // We aggregate /v1/models results from every API key in the store and
+  // tag each model with the source key (so the picker can show which key
+  // a model belongs to and so the generation handler can dispatch with
+  // the correct key). The shell bumps keyVersion to trigger a re-read.
+  const [modelSources, setModelSources] = useState({}); // { [modelId]: { sourceKeyId, sourceKeyName } }
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    if (getProvider() !== PROVIDER_NEWAPI || !apiKey) {
-      setAvailableModelIds(null);
-      setModelsFetchError(null);
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      try {
-        const ids = await fetchProviderModels(apiKey);
-        if (cancelled) return;
-        setAvailableModelIds(new Set(ids || []));
-        setModelsFetchError(null);
-      } catch (err) {
-        if (cancelled) return;
-        console.warn('[ImageStudio] /v1/models fetch failed:', err);
-        setModelsFetchError(err.message || 'Failed to fetch model list');
-        // Fall back to no filter so the user still sees something usable.
-        setAvailableModelIds(null);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [apiKey]);
+    const list = getAllAvailableModels();
+    const map = {};
+    for (const m of list) map[m.id] = { sourceKeyId: m.sourceKeyId, sourceKeyName: m.sourceKeyName };
+    setModelSources(map);
+  }, [keyVersion]);
+
+  const availableModelIds = useMemo(() => new Set(Object.keys(modelSources)), [modelSources]);
 
   // Use prop history if provided, otherwise local
   const history = historyItems ?? localHistory;
@@ -909,7 +909,7 @@ export default function ImageStudio({
       const urls = await Promise.all(
         toUpload.map(async (file) => {
           try {
-            return await uploadFile(apiKey, file);
+            return await uploadFile('', file);
           } catch (err) {
             console.error(
               "[ImageStudio] Drop upload failed for",
@@ -942,23 +942,28 @@ export default function ImageStudio({
 
   // ── Derived: current model lists & helpers ───────────────────────────────
   const filteredT2I = useMemo(() => {
-    if (!availableModelIds) return t2iModels;
     const fromCatalog = t2iModels.filter(m => availableModelIds.has(m.id));
     const known = new Set(fromCatalog.map(m => m.id));
     const extras = [...availableModelIds]
       .filter(id => !known.has(id))
       .map(id => ({ id, name: id, endpoint: id, inputs: {} }));
-    return [...fromCatalog, ...extras];
-  }, [availableModelIds]);
+    // Decorate each entry with the source key name (drives the picker chip).
+    return [...fromCatalog, ...extras].map(m => ({
+      ...m,
+      sourceKeyName: modelSources[m.id]?.sourceKeyName,
+    }));
+  }, [availableModelIds, modelSources]);
   const filteredI2I = useMemo(() => {
-    if (!availableModelIds) return i2iModels;
     const fromCatalog = i2iModels.filter(m => availableModelIds.has(m.id));
     const known = new Set(fromCatalog.map(m => m.id));
     const extras = [...availableModelIds]
       .filter(id => !known.has(id))
       .map(id => ({ id, name: id, endpoint: id, imageField: 'image_url', inputs: {} }));
-    return [...fromCatalog, ...extras];
-  }, [availableModelIds]);
+    return [...fromCatalog, ...extras].map(m => ({
+      ...m,
+      sourceKeyName: modelSources[m.id]?.sourceKeyName,
+    }));
+  }, [availableModelIds, modelSources]);
   const currentModels = imageMode ? filteredI2I : filteredT2I;
 
   // If the active selection is no longer in the visible list (e.g., user just
@@ -1094,6 +1099,17 @@ export default function ImageStudio({
       }
     }
 
+    // Resolve which API key owns the selected model. Fail fast with a clear
+    // message if no key in the multi-key store advertises this model — this
+    // typically means the user deleted the key or it was never added.
+    const keyEntry = getKeyForModel(selectedModelId);
+    if (!keyEntry) {
+      setGenerateError('No API key found for this model. Add a key in Settings.');
+      setTimeout(() => setGenerateError(null), 4000);
+      return;
+    }
+    const activeKey = keyEntry.key;
+
     setGenerating(true);
     setGenerateError(null);
 
@@ -1111,7 +1127,7 @@ export default function ImageStudio({
             if (currentQualityField && selectedQuality) {
               genParams[currentQualityField] = selectedQuality;
             }
-            return await generateI2I(apiKey, genParams);
+            return await generateI2I(activeKey, genParams);
           } else {
             const genParams = {
               model: selectedModelId,
@@ -1121,7 +1137,7 @@ export default function ImageStudio({
             if (currentQualityField && selectedQuality) {
               genParams[currentQualityField] = selectedQuality;
             }
-            return await generateImage(apiKey, genParams);
+            return await generateImage(activeKey, genParams);
           }
         })
       );
@@ -1275,7 +1291,6 @@ export default function ImageStudio({
           {/* Top row: upload picker + textarea */}
           <div className="flex items-center gap-2">
             <UploadButton
-              apiKey={apiKey}
               maxImages={maxImages}
               onSelect={handleUploadSelect}
               onClear={handleUploadClear}

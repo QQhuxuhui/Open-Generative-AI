@@ -1,15 +1,21 @@
 // OpenAI-compatible image client (new-api / one-api / OpenAI direct).
-// Mirrors the muapi.js export surface so the rest of the app can switch providers
-// by importing from a unified provider module.
+// Base URL is locked to the platform deployment (Sparkcode multimedia
+// platform by default). Override via env at build time:
+//   NEXT_PUBLIC_NEWAPI_BASE_URL=https://your-relay.example/v1
+//
+// All entry points take an explicit `apiKey` so the caller (provider.js)
+// can dispatch per-model to the right user key from the multi-key store.
 
-const NEWAPI_BASE_KEY = 'newapi_base_url';
-const NEWAPI_KEY_FALLBACK_DEFAULT = 'https://api.openai.com/v1';
+const PLATFORM_DEFAULT_BASE_URL = 'https://api.sparkcode.top/v1';
 
-function getBaseUrl() {
-    if (typeof window === 'undefined') return NEWAPI_KEY_FALLBACK_DEFAULT;
-    const raw = window.localStorage.getItem(NEWAPI_BASE_KEY);
-    if (!raw) return NEWAPI_KEY_FALLBACK_DEFAULT;
-    return raw.replace(/\/+$/, '');
+export function getBaseUrl() {
+    // process.env.NEXT_PUBLIC_* is inlined at build time by Next.js, so this
+    // works in both server and browser bundles.
+    const fromEnv = (typeof process !== 'undefined'
+        && process.env
+        && process.env.NEXT_PUBLIC_NEWAPI_BASE_URL) || '';
+    const url = fromEnv || PLATFORM_DEFAULT_BASE_URL;
+    return url.replace(/\/+$/, '');
 }
 
 // Map a UI aspect ratio to a `size` string accepted by OpenAI's Images API.

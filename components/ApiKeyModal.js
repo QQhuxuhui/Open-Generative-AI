@@ -1,16 +1,36 @@
 'use client';
 
 import { useState } from 'react';
+import { addApiKey, refreshApiKeyModels, getBaseUrl } from 'studio';
+
+const PLATFORM_NAME = 'Sparkcode多媒体平台';
 
 export default function ApiKeyModal({ onSave }) {
   const [key, setKey] = useState('');
   const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
 
-  const handleSubmit = (e) => {
+  const baseUrl = getBaseUrl();
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
+    setError('');
     const trimmed = key.trim();
-    if (!trimmed) { setError('Please enter your API key'); return; }
-    onSave(trimmed);
+    if (!trimmed) { setError('请输入 API Key'); return; }
+    setBusy(true);
+    try {
+      const entry = addApiKey({ name: 'Default', key: trimmed });
+      const refreshed = await refreshApiKeyModels(entry.id);
+      if (refreshed && refreshed.healthy === false) {
+        setError(`Key 已保存，但连接失败：${refreshed.error}`);
+        // Still call onSave so the user can enter the studio and fix in Settings.
+      }
+      onSave(trimmed);
+    } catch (err) {
+      setError(err.message || '保存失败');
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -23,24 +43,25 @@ export default function ApiKeyModal({ onSave }) {
             </svg>
           </div>
           <h1 className="text-xl font-bold text-white tracking-tight mb-2">
-            Open Generative AI
+            {PLATFORM_NAME}
           </h1>
           <p className="text-white/40 text-[13px] leading-relaxed px-4">
-            Enter your <a href="https://muapi.ai/access-keys" target="_blank" rel="noreferrer" className="text-[#d9ff00] hover:text-[#e5ff33] transition-colors">Muapi.ai</a> API key to start creating
+            输入你在 {PLATFORM_NAME} 的 API Key 开始创作
           </p>
+          <p className="text-white/25 text-[11px] mt-2 font-mono">{baseUrl}</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-6">
           <div className="space-y-2">
             <label className="block text-xs font-bold text-white/30 ml-1">
-              API Access Key
+              API Key
             </label>
             <input
               type="password"
               value={key}
               onChange={(e) => { setKey(e.target.value); setError(''); }}
-              placeholder="Paste your key here..."
-              className="w-full bg-white/5 border border-white/[0.03] rounded-md px-5 py-3 text-sm text-white placeholder:text-white/10 focus:outline-none focus:ring-1 focus:ring-[#d9ff00]/30 focus:bg-white/[0.07] transition-all"
+              placeholder="sk-..."
+              className="w-full bg-white/5 border border-white/[0.03] rounded-md px-5 py-3 text-sm text-white placeholder:text-white/10 focus:outline-none focus:ring-1 focus:ring-[#d9ff00]/30 focus:bg-white/[0.07] transition-all font-mono"
               suppressHydrationWarning
             />
             {error && <p className="mt-2 text-red-500/80 text-[11px] font-medium ml-1">{error}</p>}
@@ -48,17 +69,16 @@ export default function ApiKeyModal({ onSave }) {
 
           <button
             type="submit"
-            className="w-full bg-[#d9ff00] text-black font-medium py-2.5 rounded-md hover:bg-[#e5ff33] hover:scale-[1.02] active:scale-[0.98] transition-all shadow-lg shadow-[#d9ff00]/5"
+            disabled={busy}
+            className="w-full bg-[#d9ff00] text-black font-medium py-2.5 rounded-md hover:bg-[#e5ff33] hover:scale-[1.02] active:scale-[0.98] transition-all shadow-lg shadow-[#d9ff00]/5 disabled:opacity-50"
             suppressHydrationWarning
           >
-            Get Started
+            {busy ? '验证中…' : '开始使用'}
           </button>
 
-          <p className="text-center text-[12px] text-white/20 pt-2">
-            Need a key?{' '}
-            <a href="https://muapi.ai/access-keys" target="_blank" rel="noreferrer" className="text-white/40 hover:text-[#d9ff00] transition-colors font-medium">
-              Get one free →
-            </a>
+          <p className="text-center text-[11px] text-white/25 pt-2 leading-relaxed">
+            进入后可在右上角设置中添加更多 Key，
+            <br />支持不同分组的模型同时使用
           </p>
         </form>
       </div>
